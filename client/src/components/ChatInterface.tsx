@@ -37,6 +37,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ className }) => {
   }, [messages]);
 
   const initializeChat = async () => {
+    console.log('ChatInterface: Initializing chat...');
     try {
       await aiEngine.initialize();
       const history = await permanentStorage.getConversationHistory(50);
@@ -63,6 +64,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ className }) => {
           confidence: 1
         };
         setMessages([welcomeMessage]);
+        console.log('ChatInterface: Welcome message added');
       }
     } catch (error) {
       console.error('Failed to initialize chat:', error);
@@ -91,8 +93,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ className }) => {
     setIsLearning(true);
 
     try {
-      // Process message through AI engine
-      const aiResponse: AIResponse = await aiEngine.processMessage(userMessage.content);
+      // Generate AI response
+      const aiResponse: AIResponse = await aiEngine.generateResponse(userMessage.content, currentLanguage);
       
       // Create AI message
       const aiMessage: Message = {
@@ -100,57 +102,34 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ className }) => {
         content: aiResponse.content,
         sender: 'ai',
         timestamp: Date.now(),
-        language: aiResponse.learningData.keywords.length > 0 ? 
-          (aiResponse.learningData.keywords.some(k => /[\u0980-\u09FF]/.test(k)) ? 'bn' : 'en') : 
-          currentLanguage,
-        confidence: aiResponse.confidence,
-        learningData: aiResponse.learningData
+        language: aiResponse.language,
+        confidence: aiResponse.confidence
       };
 
-      // Simulate typing delay for better UX
-      setTimeout(() => {
-        setMessages(prev => [...prev, aiMessage]);
-        setIsTyping(false);
-        setIsLearning(false);
-        
-        // Update stats
-        setKnowledgeStats(prev => ({
-          entries: prev.entries + (aiResponse.source === 'knowledge' ? 0 : 1),
-          conversations: prev.conversations
-        }));
+      // Update messages
+      setMessages(prev => [...prev, aiMessage]);
+      setIsTyping(false);
+      setIsLearning(false);
+      
+      // Save messages
+      await permanentStorage.saveMessage(userMessage);
+      await permanentStorage.saveMessage(aiMessage);
+      
+      // Learn from conversation
+      await aiEngine.learnFromConversation(userMessage.content, aiResponse.content);
+      
+      // Update stats
+      setKnowledgeStats(prev => ({
+        entries: prev.entries + 1,
+        conversations: prev.conversations + 1
+      }));
 
-        // Show learning indicator
-        if (aiResponse.source !== 'knowledge') {
-          toast({
-            title: "🧠 Learning!",
-            description: currentLanguage === 'bn' 
-              ? "আমি এই কথোপকথন থেকে নতুন কিছু শিখলাম!"
-              : "I learned something new from this conversation!",
-          });
-        }
-      }, 1000 + Math.random() * 1000);
-
-      // Save conversation
-      await permanentStorage.saveKnowledgeBase({
-        version: '1.0.0',
-        lastUpdated: Date.now(),
-        conversations: [...messages, userMessage, aiMessage],
-        knowledge: [], // Will be updated by AI engine
-        userPreferences: {
-          preferredLanguage: currentLanguage,
-          responseStyle: 'casual',
-          learningMode: true,
-          autoExport: true,
-          webAccess: true
-        },
-        stats: {
-          totalConversations: 1,
-          totalMessages: messages.length + 2,
-          knowledgeEntries: knowledgeStats.entries,
-          lastBackup: Date.now(),
-          learningAccuracy: aiResponse.confidence,
-          responseTime: [Date.now() - userMessage.timestamp]
-        }
+      // Show learning indicator
+      toast({
+        title: "🧠 Learning!",
+        description: currentLanguage === 'bn' 
+          ? "আমি এই কথোপকথন থেকে নতুন কিছু শিখলাম!"
+          : "I learned something new from this conversation!",
       });
 
     } catch (error) {
@@ -166,231 +145,196 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ className }) => {
     }
   };
 
-  const exportConversation = async () => {
-    try {
-      const kb = await permanentStorage.loadKnowledgeBase();
-      if (kb) {
-        await permanentStorage.exportToFile(kb);
-        toast({
-          title: "✅ Export Complete",
-          description: "Your AI's knowledge has been downloaded as a backup file.",
-        });
-      }
-    } catch (error) {
-      toast({
-        title: "Export Failed",
-        description: "Could not export conversation data.",
-        variant: "destructive"
-      });
-    }
-  };
-
-  const importConversation = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    try {
-      const importedKB = await permanentStorage.importFromFile(file);
-      if (importedKB) {
-        setMessages(importedKB.conversations);
-        setKnowledgeStats({
-          entries: importedKB.knowledge.length,
-          conversations: importedKB.stats.totalConversations
-        });
-        
-        toast({
-          title: "✅ Import Complete",
-          description: `Restored ${importedKB.conversations.length} messages and ${importedKB.knowledge.length} knowledge entries.`,
-        });
-      }
-    } catch (error) {
-      toast({
-        title: "Import Failed",
-        description: "Could not import the selected file.",
-        variant: "destructive"
-      });
-    }
-  };
-
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
+  const exportData = async () => {
+    try {
+      const data = await permanentStorage.exportData();
+      const blob = new Blob([data], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ai-assistant-backup-${new Date().toISOString().split('T')[0]}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      
+      toast({
+        title: "Export Successful",
+        description: "Your conversation data has been exported.",
+      });
+    } catch (error) {
+      toast({
+        title: "Export Failed", 
+        description: "Failed to export data. Please try again.",
+        variant: "destructive"
+      });
+    }
+  };
+
+  const importData = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const success = await permanentStorage.importData(text);
+      
+      if (success) {
+        await initializeChat();
+        toast({
+          title: "Import Successful",
+          description: "Your conversation data has been imported.",
+        });
+      } else {
+        throw new Error('Invalid file format');
+      }
+    } catch (error) {
+      toast({
+        title: "Import Failed",
+        description: "Failed to import data. Please check the file format.",
+        variant: "destructive"
+      });
+    }
+    
+    // Reset file input
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  };
+
   return (
-    <div className={cn("flex flex-col h-full max-w-4xl mx-auto", className)}>
-      {/* Header with stats */}
-      <div className="flex items-center justify-between p-4 border-b bg-gradient-card backdrop-blur-sm">
-        <div className="flex items-center gap-3">
-          <div className="p-2 bg-gradient-ai rounded-lg shadow-ai">
-            <Brain className="w-5 h-5 text-white" />
+    <div className={cn("flex flex-col h-full bg-gradient-to-b from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-800", className)}>
+      {/* Header */}
+      <div className="flex-shrink-0 p-4 border-b bg-white/50 dark:bg-slate-800/50 backdrop-blur-sm">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center space-x-3">
+            <div className="flex items-center space-x-2">
+              <Brain className="h-6 w-6 text-primary" />
+              <h1 className="text-xl font-semibold text-foreground">
+                AI Assistant
+              </h1>
+            </div>
+            {isLearning && (
+              <Badge variant="secondary" className="animate-pulse">
+                <Zap className="h-3 w-3 mr-1" />
+                Learning...
+              </Badge>
+            )}
           </div>
-          <div>
-            <h1 className="font-semibold text-foreground">AI Assistant</h1>
-            <p className="text-sm text-muted-foreground">
-              Learning • {knowledgeStats.entries} entries • {knowledgeStats.conversations} chats
-            </p>
+          
+          <div className="flex items-center space-x-2">
+            <Badge variant="outline">
+              <Globe className="h-3 w-3 mr-1" />
+              {currentLanguage === 'auto' ? 'Auto' : currentLanguage.toUpperCase()}
+            </Badge>
+            <Badge variant="outline">
+              {knowledgeStats.entries} learned
+            </Badge>
+            
+            <Button variant="ghost" size="sm" onClick={exportData}>
+              <Download className="h-4 w-4" />
+            </Button>
+            
+            <Button variant="ghost" size="sm" onClick={() => fileInputRef.current?.click()}>
+              <Upload className="h-4 w-4" />
+            </Button>
+            
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json"
+              onChange={importData}
+              className="hidden"
+            />
           </div>
-        </div>
-
-        <div className="flex items-center gap-2">
-          <Badge variant="secondary" className="gap-1">
-            <Zap className="w-3 h-3" />
-            {isLearning ? 'Learning...' : 'Ready'}
-          </Badge>
-          
-          <select
-            value={currentLanguage}
-            onChange={(e) => setCurrentLanguage(e.target.value as 'en' | 'bn' | 'auto')}
-            className="text-sm bg-background border border-border rounded px-2 py-1"
-          >
-            <option value="auto">Auto</option>
-            <option value="en">English</option>
-            <option value="bn">বাংলা</option>
-          </select>
-
-          <Button variant="ghost" size="sm" onClick={exportConversation}>
-            <Download className="w-4 h-4" />
-          </Button>
-          
-          <Button 
-            variant="ghost" 
-            size="sm" 
-            onClick={() => fileInputRef.current?.click()}
-          >
-            <Upload className="w-4 h-4" />
-          </Button>
-          
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".json"
-            onChange={importConversation}
-            className="hidden"
-          />
         </div>
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-gradient-bg">
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.map((message) => (
           <div
             key={message.id}
             className={cn(
-              "flex animate-slide-up",
-              message.sender === 'user' ? 'justify-end' : 'justify-start'
+              "flex w-full",
+              message.sender === 'user' ? "justify-end" : "justify-start"
             )}
           >
             <Card
               className={cn(
-                "max-w-[80%] p-4 shadow-card transition-all duration-300 hover:shadow-float",
+                "max-w-[80%] p-4 shadow-lg border-0",
                 message.sender === 'user'
-                  ? "bg-gradient-user text-white shadow-user ml-12"
-                  : "bg-gradient-ai text-white shadow-ai mr-12"
+                  ? "bg-gradient-to-r from-blue-500 to-blue-600 text-white"
+                  : "bg-gradient-to-r from-purple-500 to-purple-600 text-white"
               )}
             >
-              <div className="space-y-2">
-                <p className="text-sm leading-relaxed whitespace-pre-wrap">
-                  {message.content}
-                </p>
-                
-                <div className="flex items-center justify-between text-xs text-white/70">
-                  <span className="flex items-center gap-1">
-                    {message.sender === 'ai' && (
-                      <>
-                        <Brain className="w-3 h-3" />
-                        {message.confidence && (
-                          <span>{Math.round(message.confidence * 100)}%</span>
-                        )}
-                      </>
-                    )}
-                    {message.language && message.language !== 'auto' && (
-                      <Badge variant="secondary" className="text-xs h-5">
-                        {message.language === 'bn' ? 'বাংলা' : 'EN'}
-                      </Badge>
-                    )}
+              <div className="text-sm font-medium mb-1">
+                {message.sender === 'user' ? 'You' : 'AI Assistant'}
+                {message.confidence && (
+                  <span className="ml-2 text-xs opacity-75">
+                    {Math.round(message.confidence * 100)}% confident
                   </span>
-                  
-                  <span>
-                    {new Date(message.timestamp).toLocaleTimeString([], {
-                      hour: '2-digit',
-                      minute: '2-digit'
-                    })}
-                  </span>
-                </div>
-
-                {message.learningData && message.learningData.keywords.length > 0 && (
-                  <div className="flex flex-wrap gap-1 mt-2">
-                    {message.learningData.keywords.slice(0, 3).map((keyword, idx) => (
-                      <Badge key={idx} variant="secondary" className="text-xs h-5">
-                        {keyword}
-                      </Badge>
-                    ))}
-                  </div>
                 )}
+              </div>
+              <div className="text-sm leading-relaxed">
+                {message.content}
+              </div>
+              <div className="text-xs opacity-75 mt-2">
+                {new Date(message.timestamp).toLocaleTimeString()}
               </div>
             </Card>
           </div>
         ))}
-
-        {/* Typing indicator */}
+        
         {isTyping && (
-          <div className="flex justify-start animate-slide-up">
-            <Card className="bg-gradient-ai text-white shadow-ai p-4 mr-12">
-              <div className="flex items-center gap-2">
-                <div className="flex gap-1">
-                  <div className="w-2 h-2 bg-white/70 rounded-full animate-thinking" style={{ animationDelay: '0ms' }} />
-                  <div className="w-2 h-2 bg-white/70 rounded-full animate-thinking" style={{ animationDelay: '200ms' }} />
-                  <div className="w-2 h-2 bg-white/70 rounded-full animate-thinking" style={{ animationDelay: '400ms' }} />
-                </div>
-                <span className="text-sm text-white/70">
-                  {isLearning ? 'Learning and thinking...' : 'Thinking...'}
-                </span>
+          <div className="flex justify-start">
+            <Card className="bg-gradient-to-r from-purple-500 to-purple-600 text-white border-0 p-4 max-w-[80%]">
+              <div className="flex items-center space-x-2">
+                <div className="animate-bounce">●</div>
+                <div className="animate-bounce delay-100">●</div>
+                <div className="animate-bounce delay-200">●</div>
+                <span className="ml-2 text-sm">AI is thinking...</span>
               </div>
             </Card>
           </div>
         )}
-
+        
         <div ref={messagesEndRef} />
       </div>
 
       {/* Input */}
-      <div className="p-4 border-t bg-background/95 backdrop-blur-sm">
-        <div className="flex gap-3">
-          <div className="flex-1 relative">
-            <Input
-              value={inputMessage}
-              onChange={(e) => setInputMessage(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && !e.shiftKey && sendMessage()}
-              placeholder={currentLanguage === 'bn' 
-                ? "আমাকে কিছু জিজ্ঞাসা করুন বা শেখান..."
-                : "Ask me anything or teach me something..."
-              }
-              className="pr-12 py-6 text-base border-2 focus:border-primary transition-all duration-300"
-              disabled={isTyping}
-            />
-            <div className="absolute right-3 top-1/2 transform -translate-y-1/2 flex items-center gap-2">
-              {isLearning && (
-                <div className="animate-pulse">
-                  <Brain className="w-4 h-4 text-ai-learning" />
-                </div>
-              )}
-            </div>
-          </div>
-          
-          <Button
-            onClick={sendMessage}
-            disabled={!inputMessage.trim() || isTyping}
-            className="px-6 py-6 bg-gradient-primary hover:animate-pulse-glow transition-all duration-300"
+      <div className="flex-shrink-0 p-4 border-t bg-white/50 dark:bg-slate-800/50 backdrop-blur-sm">
+        <div className="flex items-center space-x-2">
+          <Input
+            value={inputMessage}
+            onChange={(e) => setInputMessage(e.target.value)}
+            onKeyPress={handleKeyPress}
+            placeholder={
+              currentLanguage === 'bn' 
+                ? "একটি বার্তা টাইপ করুন..." 
+                : "Type a message..."
+            }
+            disabled={isTyping}
+            className="flex-1"
+          />
+          <Button 
+            onClick={sendMessage} 
+            disabled={isTyping || !inputMessage.trim()}
+            className="px-4"
           >
-            <Send className="w-5 h-5" />
+            <Send className="h-4 w-4" />
           </Button>
-        </div>
-        
-        <div className="mt-2 text-xs text-muted-foreground text-center">
-          {currentLanguage === 'bn' 
-            ? "আমি প্রতিটি কথোপকথন থেকে শিখি এবং স্থায়ীভাবে মনে রাখি • ওয়েব অনুসন্ধান সক্ষম"
-            : "I learn from every conversation and remember permanently • Web search enabled"
-          }
         </div>
       </div>
     </div>

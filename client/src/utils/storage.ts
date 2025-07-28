@@ -1,281 +1,106 @@
-// Permanent Storage System - Multiple persistence layers for bulletproof data retention
-
-import { AIKnowledgeBase, ExportData, Message, KnowledgeEntry } from '@/types/ai';
+import { Message, KnowledgeBase, KnowledgeEntry } from '@/types/ai';
 
 class PermanentStorage {
-  private dbName = 'AIAssistantDB';
-  private dbVersion = 1;
-  private db: IDBDatabase | null = null;
+  private storageKey = 'ai-assistant-data';
 
-  constructor() {
-    this.initializeDB();
-  }
-
-  // Initialize IndexedDB for permanent storage
-  private async initializeDB(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const request = indexedDB.open(this.dbName, this.dbVersion);
-
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => {
-        this.db = request.result;
-        resolve();
-      };
-
-      request.onupgradeneeded = (event) => {
-        const db = (event.target as IDBOpenDBRequest).result;
-        
-        // Create stores for different data types
-        if (!db.objectStoreNames.contains('knowledge')) {
-          const knowledgeStore = db.createObjectStore('knowledge', { keyPath: 'id' });
-          knowledgeStore.createIndex('keywords', 'keywords', { multiEntry: true });
-          knowledgeStore.createIndex('language', 'language');
-        }
-
-        if (!db.objectStoreNames.contains('conversations')) {
-          const conversationStore = db.createObjectStore('conversations', { keyPath: 'id' });
-          conversationStore.createIndex('timestamp', 'timestamp');
-          conversationStore.createIndex('sender', 'sender');
-        }
-
-        if (!db.objectStoreNames.contains('settings')) {
-          db.createObjectStore('settings', { keyPath: 'key' });
-        }
-
-        if (!db.objectStoreNames.contains('backups')) {
-          const backupStore = db.createObjectStore('backups', { keyPath: 'timestamp' });
-          backupStore.createIndex('version', 'version');
-        }
-      };
-    });
-  }
-
-  // Save knowledge base with version control
-  async saveKnowledgeBase(knowledgeBase: AIKnowledgeBase): Promise<void> {
-    if (!this.db) await this.initializeDB();
-
-    const transaction = this.db!.transaction(['knowledge', 'conversations', 'settings'], 'readwrite');
-    
-    // Save knowledge entries
-    const knowledgeStore = transaction.objectStore('knowledge');
-    for (const entry of knowledgeBase.knowledge) {
-      await this.promisifyRequest(knowledgeStore.put(entry));
-    }
-
-    // Save conversations
-    const conversationStore = transaction.objectStore('conversations');
-    for (const message of knowledgeBase.conversations) {
-      await this.promisifyRequest(conversationStore.put(message));
-    }
-
-    // Save settings
-    const settingsStore = transaction.objectStore('settings');
-    await this.promisifyRequest(settingsStore.put({
-      key: 'userPreferences',
-      value: knowledgeBase.userPreferences
-    }));
-    await this.promisifyRequest(settingsStore.put({
-      key: 'stats',
-      value: knowledgeBase.stats
-    }));
-    await this.promisifyRequest(settingsStore.put({
-      key: 'lastUpdated',
-      value: knowledgeBase.lastUpdated
-    }));
-
-    // Auto-backup if enabled
-    if (knowledgeBase.userPreferences.autoExport) {
-      await this.createBackup(knowledgeBase);
-    }
-  }
-
-  // Load complete knowledge base
-  async loadKnowledgeBase(): Promise<AIKnowledgeBase | null> {
-    if (!this.db) await this.initializeDB();
-
+  async getConversationHistory(limit: number = 50): Promise<Message[]> {
     try {
-      const transaction = this.db!.transaction(['knowledge', 'conversations', 'settings'], 'readonly');
+      const data = localStorage.getItem(`${this.storageKey}-messages`);
+      if (!data) return [];
       
-      // Load all knowledge entries
-      const knowledgeStore = transaction.objectStore('knowledge');
-      const knowledge = await this.promisifyRequest(knowledgeStore.getAll()) as KnowledgeEntry[];
-
-      // Load all conversations
-      const conversationStore = transaction.objectStore('conversations');
-      const conversations = await this.promisifyRequest(conversationStore.getAll()) as Message[];
-
-      // Load settings
-      const settingsStore = transaction.objectStore('settings');
-      const userPreferences = await this.promisifyRequest(settingsStore.get('userPreferences'));
-      const stats = await this.promisifyRequest(settingsStore.get('stats'));
-      const lastUpdated = await this.promisifyRequest(settingsStore.get('lastUpdated'));
-
-      return {
-        version: '1.0.0',
-        lastUpdated: lastUpdated?.value || Date.now(),
-        conversations: conversations.sort((a, b) => a.timestamp - b.timestamp),
-        knowledge: knowledge.sort((a, b) => b.frequency - a.frequency),
-        userPreferences: userPreferences?.value || this.getDefaultPreferences(),
-        stats: stats?.value || this.getDefaultStats()
-      };
+      const messages: Message[] = JSON.parse(data);
+      return messages.slice(-limit);
     } catch (error) {
-      console.error('Error loading knowledge base:', error);
-      return null;
+      console.error('Failed to load conversation history:', error);
+      return [];
     }
   }
 
-  // Create versioned backup
-  async createBackup(knowledgeBase: AIKnowledgeBase): Promise<void> {
-    if (!this.db) await this.initializeDB();
-
-    const backup: ExportData = {
-      timestamp: Date.now(),
-      version: knowledgeBase.version,
-      knowledgeBase,
-      filename: `ai_backup_${new Date().toISOString().split('T')[0]}.json`
-    };
-
-    const transaction = this.db!.transaction(['backups'], 'readwrite');
-    const backupStore = transaction.objectStore('backups');
-    await this.promisifyRequest(backupStore.put(backup));
-
-    // Keep only last 10 backups
-    const allBackups = await this.promisifyRequest(backupStore.getAll()) as ExportData[];
-    if (allBackups.length > 10) {
-      const oldestBackups = allBackups
-        .sort((a, b) => a.timestamp - b.timestamp)
-        .slice(0, allBackups.length - 10);
-      
-      for (const oldBackup of oldestBackups) {
-        await this.promisifyRequest(backupStore.delete(oldBackup.timestamp));
-      }
-    }
-  }
-
-  // Export knowledge base to downloadable file
-  async exportToFile(knowledgeBase: AIKnowledgeBase): Promise<void> {
-    const exportData: ExportData = {
-      timestamp: Date.now(),
-      version: knowledgeBase.version,
-      knowledgeBase,
-      filename: `ai_knowledge_export_${new Date().toISOString().split('T')[0]}.json`
-    };
-
-    const blob = new Blob([JSON.stringify(exportData, null, 2)], {
-      type: 'application/json'
-    });
-
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = exportData.filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }
-
-  // Import knowledge base from file
-  async importFromFile(file: File): Promise<AIKnowledgeBase | null> {
+  async saveMessage(message: Message): Promise<void> {
     try {
-      const text = await file.text();
-      const exportData: ExportData = JSON.parse(text);
-      
-      if (exportData.knowledgeBase && exportData.version) {
-        await this.saveKnowledgeBase(exportData.knowledgeBase);
-        return exportData.knowledgeBase;
-      }
-      return null;
+      const existing = await this.getConversationHistory(1000);
+      const updated = [...existing, message];
+      localStorage.setItem(`${this.storageKey}-messages`, JSON.stringify(updated));
     } catch (error) {
-      console.error('Error importing file:', error);
+      console.error('Failed to save message:', error);
+    }
+  }
+
+  async loadKnowledgeBase(): Promise<KnowledgeBase | null> {
+    try {
+      const data = localStorage.getItem(`${this.storageKey}-knowledge`);
+      if (!data) {
+        return {
+          knowledge: [],
+          stats: {
+            totalConversations: 0,
+            lastUpdated: Date.now()
+          }
+        };
+      }
+      return JSON.parse(data);
+    } catch (error) {
+      console.error('Failed to load knowledge base:', error);
       return null;
     }
   }
 
-  // Search knowledge by keywords
-  async searchKnowledge(keywords: string[], language?: 'en' | 'bn'): Promise<KnowledgeEntry[]> {
-    if (!this.db) await this.initializeDB();
-
-    const transaction = this.db!.transaction(['knowledge'], 'readonly');
-    const store = transaction.objectStore('knowledge');
-    const index = store.index('keywords');
-
-    const results: KnowledgeEntry[] = [];
-    for (const keyword of keywords) {
-      const entries = await this.promisifyRequest(index.getAll(keyword.toLowerCase())) as KnowledgeEntry[];
-      results.push(...entries);
+  async saveKnowledgeEntry(entry: KnowledgeEntry): Promise<void> {
+    try {
+      const kb = await this.loadKnowledgeBase() || {
+        knowledge: [],
+        stats: { totalConversations: 0, lastUpdated: Date.now() }
+      };
+      
+      kb.knowledge.push(entry);
+      kb.stats.lastUpdated = Date.now();
+      
+      localStorage.setItem(`${this.storageKey}-knowledge`, JSON.stringify(kb));
+    } catch (error) {
+      console.error('Failed to save knowledge entry:', error);
     }
-
-    // Filter by language if specified
-    const filtered = language 
-      ? results.filter(entry => entry.language === language || entry.language === 'both')
-      : results;
-
-    // Remove duplicates and sort by relevance
-    const unique = filtered.filter((entry, index, self) => 
-      index === self.findIndex(e => e.id === entry.id)
-    );
-
-    return unique.sort((a, b) => b.confidence * b.frequency - a.confidence * a.frequency);
   }
 
-  // Get conversation history
-  async getConversationHistory(limit: number = 100): Promise<Message[]> {
-    if (!this.db) await this.initializeDB();
-
-    const transaction = this.db!.transaction(['conversations'], 'readonly');
-    const store = transaction.objectStore('conversations');
-    const index = store.index('timestamp');
-
-    const messages = await this.promisifyRequest(index.getAll()) as Message[];
-    return messages
-      .sort((a, b) => b.timestamp - a.timestamp)
-      .slice(0, limit);
+  async exportData(): Promise<string> {
+    try {
+      const messages = await this.getConversationHistory(1000);
+      const knowledge = await this.loadKnowledgeBase();
+      
+      const exportData = {
+        messages,
+        knowledge,
+        exportedAt: Date.now()
+      };
+      
+      return JSON.stringify(exportData, null, 2);
+    } catch (error) {
+      console.error('Failed to export data:', error);
+      return '{}';
+    }
   }
 
-  // Clear all data (with confirmation)
-  async clearAllData(): Promise<void> {
-    if (!this.db) await this.initializeDB();
-
-    const transaction = this.db!.transaction(['knowledge', 'conversations', 'settings', 'backups'], 'readwrite');
-    
-    await Promise.all([
-      this.promisifyRequest(transaction.objectStore('knowledge').clear()),
-      this.promisifyRequest(transaction.objectStore('conversations').clear()),
-      this.promisifyRequest(transaction.objectStore('settings').clear()),
-      this.promisifyRequest(transaction.objectStore('backups').clear())
-    ]);
+  async importData(jsonData: string): Promise<boolean> {
+    try {
+      const data = JSON.parse(jsonData);
+      
+      if (data.messages) {
+        localStorage.setItem(`${this.storageKey}-messages`, JSON.stringify(data.messages));
+      }
+      
+      if (data.knowledge) {
+        localStorage.setItem(`${this.storageKey}-knowledge`, JSON.stringify(data.knowledge));
+      }
+      
+      return true;
+    } catch (error) {
+      console.error('Failed to import data:', error);
+      return false;
+    }
   }
 
-  // Utility: Convert IDBRequest to Promise
-  private promisifyRequest(request: IDBRequest): Promise<any> {
-    return new Promise((resolve, reject) => {
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-  }
-
-  // Default preferences
-  private getDefaultPreferences() {
-    return {
-      preferredLanguage: 'auto' as const,
-      responseStyle: 'casual' as const,
-      learningMode: true,
-      autoExport: true,
-      webAccess: true
-    };
-  }
-
-  // Default stats
-  private getDefaultStats() {
-    return {
-      totalConversations: 0,
-      totalMessages: 0,
-      knowledgeEntries: 0,
-      lastBackup: 0,
-      learningAccuracy: 0.5,
-      responseTime: []
-    };
+  async clearAll(): Promise<void> {
+    localStorage.removeItem(`${this.storageKey}-messages`);
+    localStorage.removeItem(`${this.storageKey}-knowledge`);
   }
 }
 
